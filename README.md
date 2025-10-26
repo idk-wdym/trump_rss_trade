@@ -68,6 +68,52 @@ python trump_tweet_monitor.py
   * `analysis_records.json` – 所有的分析结果记录
   * `analyzed_guids.json` – 已处理过的推文 ID，用于去重
 
+### Apple Shortcut / 自动叫醒集成
+
+现在可以在 `config.ini` 中的 `[shortcut]` 段开启一个额外的 Webhook，当模型判定推文“足够重要”时触发 Apple Shortcut 或其他自动化：
+
+```ini
+[shortcut]
+enable = true
+trigger_url = https://example.com/your/shortcut/webhook
+http_method = POST
+min_importance = high
+require_impact = true
+payload_type = json
+timeout = 5
+auth_token = YOUR_SECRET
+```
+
+触发条件基于模型输出：
+
+* `impact=true`（可通过 `require_impact=false` 放宽）
+* `importance` 达到 `min_importance`（`high`/`medium`/`low`/`none`）
+
+默认会发送下列 JSON 负载：
+
+```json
+{
+  "title": "特朗普推文标题",
+  "impact": true,
+  "importance": "high",
+  "assets": ["US equities"],
+  "reason": "模型的中文理由",
+  "summary": "原文的中文翻译/提炼",
+  "link": "原文链接",
+  "timestamp": "2025-01-01T08:30:00+08:00"
+}
+```
+
+需要自定义格式时，可在 `payload_template` 中编写多行模板（使用 Python `str.format` 占位符）。额外提供了 `{impact_json}`、`{impact_text}`、`{asset_json}` 等字段，便于直接拼出合法 JSON 或可读文本。
+
+实用建议：
+
+1. **Apple Shortcut Webhook**（iOS/macOS） – 在 Shortcuts 应用中创建“个人自动化 → 当接收到网络请求时”，使用“获取 URL 内容”动作取出 JSON，最终触发“播放声音/振动”等操作唤醒家人。
+2. **借助 Pushcut / IFTTT** – 如果需要推送到 iPhone 并唤醒，可使用 Pushcut 的 Webhook 或 IFTTT Webhooks + 通知，然后在手机端触发 Shortcut/闹钟。
+3. **HomeKit / 智能家居** – 将 Shortcut 与 HomeKit 场景连接，例如打开卧室灯、播放 HomePod 闹铃，实现“叫醒”动作。
+
+结合现有的 Server酱 推送，你可以同时获得常规通知与极端重要事件的“紧急唤醒”自动化。
+
 ### 部署
 
 你可以将此脚本作为 systemd 服务在后台持续运行。

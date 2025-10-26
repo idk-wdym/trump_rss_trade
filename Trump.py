@@ -503,8 +503,20 @@ class TrumpTweetMonitor:
 
         self.serverchan_uid = self.config.get("serverchan", "uid", fallback="").strip()
 
+        # ---- Apple Shortcut / Webhook 集成相关设置 ----
+        self.shortcut_enable = self.config.getboolean("shortcut", "enable", fallback=False)
+        self.shortcut_trigger_url = self.config.get("shortcut", "trigger_url", fallback="").strip()
+        self.shortcut_http_method = self.config.get("shortcut", "http_method", fallback="POST").strip().upper()
+        self.shortcut_min_importance = self.config.get("shortcut", "min_importance", fallback="high").strip().lower()
+        self.shortcut_require_impact = self.config.getboolean("shortcut", "require_impact", fallback=True)
+        self.shortcut_payload_template = _cfg_get_multiline(self.config, "shortcut", "payload_template")
+        self.shortcut_payload_type = self.config.get("shortcut", "payload_type", fallback="json").strip().lower()
+        self.shortcut_timeout = self.config.getfloat("shortcut", "timeout", fallback=5.0)
+        self.shortcut_auth_token = self.config.get("shortcut", "auth_token", fallback="").strip()
+
         self.model_rpm = self.config.getint("rate_limit", "model_rpm", fallback=30)
         self.push_rpm = self.config.getint("rate_limit", "push_rpm", fallback=20)
+        self.shortcut_rpm = self.config.getint("rate_limit", "shortcut_rpm", fallback=5)
         self.max_entries_per_cycle = self.config.getint("rate_limit", "max_entries_per_cycle", fallback=50)
         self.min_sleep_between_entries_ms = self.config.getint("rate_limit", "min_sleep_between_entries_ms", fallback=200)
 
@@ -520,6 +532,12 @@ class TrumpTweetMonitor:
                 "capacity": self.push_rpm,
                 "tokens": float(self.push_rpm),
                 "rate_per_sec": self.push_rpm / 60.0,
+                "updated": now_mono,
+            },
+            "shortcut": {
+                "capacity": max(1, self.shortcut_rpm),
+                "tokens": float(max(1, self.shortcut_rpm)),
+                "rate_per_sec": max(1, self.shortcut_rpm) / 60.0,
                 "updated": now_mono,
             },
         }
@@ -585,6 +603,132 @@ class TrumpTweetMonitor:
             logging.warning("推送限速未获得令牌，本次跳过")
             return
         self.pusher.push(message, title=self.push_title, tags=self.push_tags)
+
+    # ---------- Apple Shortcut 集成 ----------
+    def _shortcut_should_fire(self, result: Dict[str, Any]) -> bool:
+        if not (self.shortcut_enable and self.shortcut_trigger_url):
+            return False
+        try:
+            importance = str(result.get("importance", "none")).strip().lower()
+        except Exception:
+            importance = "none"
+        if self.shortcut_require_impact and not bool(result.get("impact") is True):
+            return False
+        threshold = IMPORTANCE_ORDER.get(self.shortcut_min_importance, 3)
+        rank = IMPORTANCE_ORDER.get(importance, 0)
+        return rank >= threshold
+
+    def trigger_shortcut(self, *, result: Dict[str, Any], title: str, link: Optional[str], tweet_text: str):
+        if not self._shortcut_should_fire(result):
+            return
+        if not self._acquire_token("shortcut", permits=1, timeout_sec=10.0):
+            logging.warning("Shortcut 限速未获得令牌，本次跳过")
+            return
+
+        asset = result.get("asset_class")
+        if isinstance(asset, list):
+            asset_str = ", ".join(asset)
+        elif isinstance(asset, str):
+            asset_str = asset
+            asset = [asset]
+        else:
+            asset_str = ""
+            asset = []
+
+        importance = str(result.get("importance", "")).strip().lower()
+        impact_bool = bool(result.get("impact") is True)
+
+        payload_context = {
+            "title": title or "",
+            "link": link or "",
+            "importance": importance,
+            "impact": impact_bool,
+            "impact_json": "true" if impact_bool else "false",
+            "impact_text": "有影响" if impact_bool else "无显著影响",
+            "reason": result.get("reason", ""),
+            "original_cn": result.get("original_cn", ""),
+            "asset_class": asset,
+            "asset_str": asset_str,
+            "asset_json": json.dumps(asset, ensure_ascii=False),
+            "tweet_text": tweet_text,
+            "timestamp": datetime.datetime.now(self.tz).isoformat(),
+        }
+
+        body_obj: Any
+        headers = {}
+        try:
+            if self.shortcut_payload_template:
+                rendered = self.shortcut_payload_template.format(**payload_context)
+            else:
+                rendered = ""
+        except Exception as e:
+            logging.error(f"Shortcut payload 模板渲染失败: {e}")
+            return
+
+        payload_type = self.shortcut_payload_type or "json"
+        if payload_type == "json":
+            headers["Content-Type"] = "application/json"
+            if self.shortcut_payload_template:
+                try:
+                    body_obj = json.loads(rendered)
+                except Exception as e:
+                    logging.error(f"Shortcut payload 不是合法 JSON: {e}")
+                    return
+            else:
+                body_obj = {
+                    "title": payload_context["title"],
+                    "impact": payload_context["impact"],
+                    "importance": payload_context["importance"],
+                    "assets": payload_context["asset_class"],
+                    "reason": payload_context["reason"],
+                    "summary": payload_context["original_cn"],
+                    "link": payload_context["link"],
+                    "timestamp": payload_context["timestamp"],
+                }
+        elif payload_type == "form":
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            if not self.shortcut_payload_template:
+                body_obj = {
+                    "title": payload_context["title"],
+                    "importance": payload_context["importance"],
+                    "impact": str(payload_context["impact"]).lower(),
+                    "link": payload_context["link"],
+                }
+            else:
+                body_obj = dict(parse_qsl(rendered, keep_blank_values=True))
+        else:
+            headers["Content-Type"] = "text/plain; charset=utf-8"
+            if not self.shortcut_payload_template:
+                body_obj = payload_context["original_cn"] or payload_context["tweet_text"]
+            else:
+                body_obj = rendered
+
+        if self.shortcut_auth_token:
+            headers["Authorization"] = f"Bearer {self.shortcut_auth_token}"
+
+        method = self.shortcut_http_method or "POST"
+        method = method.upper()
+        request_kwargs: Dict[str, Any] = {"headers": headers, "timeout": self.shortcut_timeout}
+
+        try:
+            if method == "GET":
+                if isinstance(body_obj, dict):
+                    request_kwargs["params"] = body_obj
+                elif body_obj:
+                    request_kwargs["params"] = {"payload": body_obj}
+                resp = self.session.get(self.shortcut_trigger_url, **request_kwargs)
+            else:
+                if payload_type == "json" and isinstance(body_obj, dict):
+                    request_kwargs["json"] = body_obj
+                elif payload_type == "form" and isinstance(body_obj, dict):
+                    request_kwargs["data"] = body_obj
+                else:
+                    request_kwargs["data"] = body_obj
+                resp = self.session.request(method, self.shortcut_trigger_url, **request_kwargs)
+            resp.raise_for_status()
+            logging.info(f"🍎 Apple Shortcut 已触发：status={resp.status_code}")
+        except Exception as e:
+            logging.error(f"Apple Shortcut 触发失败: {e}")
 
     # ---------- 稳健模型调用 ----------
     def analyze_with_model(self, tweet_text):
@@ -875,7 +1019,8 @@ class TrumpTweetMonitor:
                         continue
 
                     link = _normalize_link(getattr(entry, "link", None))
-                    logging.info(f"🆕 检测到新推文: {(_strip_html_keep_text(getattr(entry, 'title', '') or '') or '[无标题]')}")
+                    title_clean = _strip_html_keep_text(getattr(entry, 'title', '') or '') or '[无标题]'
+                    logging.info(f"🆕 检测到新推文: {title_clean}")
                     result = self.analyze_with_model(tweet_text)
 
                     if result:
@@ -887,6 +1032,8 @@ class TrumpTweetMonitor:
                         threshold = IMPORTANCE_ORDER.get(self.push_min_importance, 3)
                         rank = IMPORTANCE_ORDER.get(imp, 0)
                         should_push = (not self.push_on_impact or impact_flag) and (rank >= threshold)
+
+                        self.trigger_shortcut(result=result, title=title_clean, link=link, tweet_text=tweet_text)
 
                         if should_push:
                             asset = result.get("asset_class")
